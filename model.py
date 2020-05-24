@@ -110,8 +110,9 @@ class PointGNN(nn.Module):
             s = graph_layer(s, x, edge_index)
 
         # Compute classification and regression output for each vertex
-        cls_pred = self._mlp_cls(s)
-        reg_pred = torch.cat([mlp_loc(s) for mlp_loc in self._mlp_loc], dim=2)
+        cls_pred = self._mlp_cls(s).squeeze(0)
+        reg_pred = torch.cat([mlp_loc(s) for mlp_loc in self._mlp_loc],
+                             dim=2).squeeze(0)
 
         return cls_pred, reg_pred
 

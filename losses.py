@@ -100,15 +100,16 @@ class MultiTaskLoss(nn.Module):
 
 if __name__ == '__main__':
 
+    batch_size = 3
     n_vertices = 1000
     n_classes = 5
 
     cls_pred = torch.rand((n_vertices, n_classes))
     cls_target = torch.randint(0, n_classes, (n_vertices, 1))
     reg_pred = torch.rand((n_vertices, 7))
-    reg_target = torch.randn((n_vertices, 7))
+    reg_target = torch.rand((n_vertices, 7))
     model = PointGNN(n_classes=5, n_iterations=5, kp_dim=3, state_dim=3)
-    named_params = model.named_parameters()
+    named_params = model.parameters()
 
     criterion = MultiTaskLoss(lambdas=(0.1, 10.0, 5e-7), object_classes=[1])
 
