@@ -3,6 +3,7 @@ import time
 import torch
 import numpy as np
 import kitti_utils
+import matplotlib.pyplot as plt
 from model import PointGNN
 from scipy.spatial import cKDTree
 from torch_geometric.data import Data
@@ -78,9 +79,14 @@ class CustomDataLoader(DataLoader):
             batch_key_points_lookup = torch.cat(list_of_shifted_lookups, dim=0)
             batch_key_points = torch.cat(list_of_key_points, dim=0)
 
+            # Concatenate labels along first dimensions
+            list_of_labels = [data_dict['labels'] for data_dict in batch]
+            labels = torch.cat(list_of_labels, dim=0)
+
             return {'graphs': batch_graphs,
                     'key_points': batch_key_points,
-                    'key_points_lookup': batch_key_points_lookup}
+                    'key_points_lookup': batch_key_points_lookup,
+                    'labels': labels}
 
         # Create PyTorch DataLoader with custom collate function
         super(CustomDataLoader,
@@ -233,9 +239,20 @@ class GraphKITTI(Dataset):
             else:
                 key_points = torch.cat((key_points, vertex_kps), dim=0)
 
+        # Compute vertex labels
+        cls_labels, boxes_3d, _, _ = \
+            kitti_utils.get_point_labels(labels, vertex_xyz.numpy(),
+                                         expand_factor=(1.1, 1.1, 1.1))
+        loc_labels = kitti_utils.box_encoding(cls_labels, vertex_xyz.numpy(),
+                                              boxes_3d)
+        vertex_labels = torch.from_numpy(np.concatenate((cls_labels,
+                                                         loc_labels), axis=1))
+
         # Create return dictionary
-        rtn_dict = {'graph': graph, 'key_points': key_points,
-                    'key_points_lookup': key_points_lookup}
+        rtn_dict = {'graph': graph,
+                    'key_points': key_points,
+                    'key_points_lookup': key_points_lookup,
+                    'labels': vertex_labels}
 
         return rtn_dict
 
@@ -265,10 +282,12 @@ if __name__ == '__main__':
         batch_graphs = batch_data['graphs']
         batch_key_points = batch_data['key_points']
         batch_lookups = batch_data['key_points_lookup']
+        labels = batch_data['labels']
 
         # Perform forward pass
         with torch.no_grad():
             cls_pred, reg_pred = net(batch_data)
         print(f'Cls Output: {cls_pred.size()}')
         print(f'Reg Output: {reg_pred.size()}')
+        print(f'Labels: {labels.size()}')
         exit()
