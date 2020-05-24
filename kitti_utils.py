@@ -1,8 +1,14 @@
 import cv2
 import copy
+import numpy as np
 from load_data import PointCloud
-from sklearn.neighbors import NearestNeighbors
 
+# Set average bounding box size (training set) in m
+l_m, h_m, w_m = 3.9, 1.56, 1.6  # length, height, width
+
+# Set normalization constants for yaw
+theta_0 = np.pi / 2.0
+theta_m = np.pi / 2.0
 
 ###################
 # 3D Label Object #
@@ -32,6 +38,9 @@ class Object3D(object):
         self.height = data[8]  # box height
         self.width = data[9]  # box width
         self.length = data[10]  # box length (in meters)
+        assert self.height > 0.0, 'Bounding Box Height <= 0.0'
+        assert self.width > 0.0, 'Bounding Box Width <= 0.0'
+        assert self.length > 0.0, 'Bounding Box Length <= 0.0'
         self.t = (data[11], data[12], data[13])
         # location (x,y,z) in camera coord.
         self.ry = data[14]
@@ -532,121 +541,131 @@ def get_rgb_feats(point_cloud, image):
     return point_cloud
 
 
-# Construct graph
-def construct_graph(points_xyz, radius, num_neighbors,
-                    neighbors_downsample_method='random'):
-    """Generate a local graph by radius neighbors.
-    """
-    # Compute nearest neighbors and get list of neighbor indices for each
-    # point
-    nbrs = NearestNeighbors(radius=radius, algorithm='ball_tree',
-                            n_jobs=1).fit(points_xyz)
-    indices = nbrs.radius_neighbors(points_xyz, return_distance=False)
-
-    # Randomly sample maximum number of neighbors
-    indices = [neighbors if neighbors.size <= num_neighbors else
-               np.random.choice(neighbors, num_neighbors, replace=False)
-               for neighbors in indices]
-
-    # Construct edges
-    vertices_v = np.concatenate(indices)
-    vertices_i = np.concatenate([i * np.ones(neighbors.size, dtype=np.int32)
-                                 for i, neighbors in enumerate(indices)])
-    edges = np.array([vertices_v, vertices_i])
-
-    return edges
-
-
 # Assign labels to points
-def get_point_labels_car(labels, xyz, expend_factor):
+def get_point_labels(labels, xyz, expand_factor):
     """
     Assign class label and bounding boxes to xyz points.
     """
+
     num_points = xyz.shape[0]
     assert num_points > 0, "No point No prediction"
     assert xyz.shape[1] == 3
-    # define label map
+
+    # Define label map
+    # NOTE: 2 is left empty since car objects are sub-classed into
+    # horizontal and vertical cars depending on orientation
     label_map = {
         'Background': 0,
         'Car': 1,
         'DontCare': 3
     }
-    # by default, all points are assigned with background label 0.
+
+    # By default, all points are assigned with background label 0
     cls_labels = np.zeros((num_points, 1), dtype=np.int64)
-    # 3d boxes for each point
-    boxes_3d = np.zeros((num_points, 1, 7))
-    valid_boxes = np.zeros((num_points, 1, 1), dtype=np.float32)
-    # add label for each object
+
+    # Container for box parameters
+    boxes_3d = np.zeros((num_points, 7))
+
+    # Mask indicating assigned boxes
+    valid_boxes = np.zeros((num_points, 1), dtype=np.int64)
+
+    # Add label for each object in scene
     for label in labels:
 
         # Get object type
         object_type = label.type
 
         # Get class id
+        # Assign "Don't Care"-Label if type not specified in label map
         class_id = label_map.get(object_type, 3)
 
+        # Compute label for car objects
         if object_type == 'Car':
 
             # Get all points inside object
-            mask = get_object_points(label, xyz, expend_factor)
+            mask = get_object_points(label, xyz, expand_factor)
+
+            # Check whether car is horizontal or vertical depending on yaw
+            # angle
             yaw = label.ry
             while yaw < -0.25 * np.pi:
                 yaw += np.pi
             while yaw > 0.75 * np.pi:
                 yaw -= np.pi
             if yaw < 0.25 * np.pi:
-                # horizontal
+                # Horizontal
                 cls_labels[mask, :] = class_id
-                boxes_3d[mask, 0, :] = (label.t[0], label.t[1], label.t[2],
-                                        label.length, label.height,
-                                        label.width, label.ry)
-                valid_boxes[mask, 0, :] = 1
+                boxes_3d[mask, :] = (label.t[0], label.t[1], label.t[2],
+                                     label.length, label.height,
+                                     label.width, label.ry)
+                valid_boxes[mask, :] = 1
             else:
-                # vertical
+                # Vertical
                 cls_labels[mask, :] = class_id + 1
-                boxes_3d[mask, 0, :] = (label.t[0], label.t[1], label.t[2],
-                                        label.length, label.height,
-                                        label.width, label.ry)
-                valid_boxes[mask, 0, :] = 1
+                boxes_3d[mask, :] = (label.t[0], label.t[1], label.t[2],
+                                     label.length, label.height,
+                                     label.width, label.ry)
+                valid_boxes[mask, :] = 1
+
+        # Compute labels for all other object types
         else:
+            # Disregard objects of "DontCare" type.
+            # NOTE: The object type can differ from the class_id
             if object_type != 'DontCare':
-                mask = get_object_points(label, xyz, expend_factor)
+
+                # Get all points inside object
+                mask = get_object_points(label, xyz, expand_factor)
+                # Assign class label
                 cls_labels[mask, :] = class_id
-                valid_boxes[mask, 0, :] = 0.0
+                # Set number of valid boxes to 0
+                valid_boxes[mask, :] = 0
+                # Set all box parameters to 1 to avoid numerical problems
+                # when e.g computing the log. Label will be ignored later
+                # anyway based on class mask.
+                boxes_3d[mask, :] = 1.0
 
     return cls_labels, boxes_3d, valid_boxes, label_map
 
 
-def get_object_points(self, label, xyz, expend_factor=(1.0, 1.0, 1.0)):
+def get_object_points(label, xyz, expand_factor=(1.0, 1.0, 1.0)):
     """Select points in a 3D box.
     Args:
-        label: a dictionary containing "x3d", "y3d", "z3d", "yaw",
-        "height", "width", "lenth".
+        label: a label object containing "x3d", "y3d", "z3d", "yaw",
+        "height", "width", "length".
     Returns: a bool mask indicating points inside a 3D box.
     """
 
-    normals, lower, upper = self.box3d_to_normals(label, expend_factor)
+    # Compute normals and box boundaries
+    normals, lower, upper = box3d_to_normals(label, expand_factor)
+
+    # Project data points onto normals
     projected = np.matmul(xyz, np.transpose(normals))
+
+    # Get mask for all dimensions
     points_in_x = np.logical_and(projected[:, 0] > lower[0],
                                  projected[:, 0] < upper[0])
     points_in_y = np.logical_and(projected[:, 1] > lower[1],
                                  projected[:, 1] < upper[1])
     points_in_z = np.logical_and(projected[:, 2] > lower[2],
                                  projected[:, 2] < upper[2])
+
+    # Combine masks to get object point mask
     mask = np.logical_and.reduce((points_in_x, points_in_y, points_in_z))
     return mask
 
 
-def box3d_to_normals(label, expend_factor=(1.0, 1.0, 1.0)):
+def box3d_to_normals(label, expand_factor=(1.0, 1.0, 1.0)):
     """Project a 3D box into camera coordinates, compute the center
     of the box and normals.
     Args:
-        label: a dictionary containing "x3d", "y3d", "z3d", "yaw",
-        "height", "width", "lenth".
+        label: a label object containing "x3d", "y3d", "z3d", "yaw",
+        "height", "width", "length".
     Returns: a numpy array [3, 3] containing [wx, wy, wz]^T, a [3] lower
         bound and a [3] upper bound.
     """
-    box3d_corners_xyz = box3d_to_cam_points(label, expend_factor)
+
+    # Get bounding box corners in camera coordinates
+    box3d_corners_xyz = box3d_to_cam_points(label, expand_factor)
     wx = box3d_corners_xyz[[0], :] - box3d_corners_xyz[[4], :]
     lx = np.matmul(wx, box3d_corners_xyz[4, :])
     ux = np.matmul(wx, box3d_corners_xyz[0, :])
@@ -660,90 +679,105 @@ def box3d_to_normals(label, expend_factor=(1.0, 1.0, 1.0)):
             np.concatenate([lx, ly, lz]), np.concatenate([ux, uy, uz]))
 
 
-def box3d_to_cam_points(label, expend_factor=(1.0, 1.0, 1.0)):
+def box3d_to_cam_points(label, expand_factor=(1.0, 1.0, 1.0)):
     """Project 3D box into camera coordinates.
     Args:
-        label: a dictionary containing "x3d", "y3d", "z3d", "yaw", "height"
+        label: a label object containing "x3d", "y3d", "z3d", "yaw", "height"
             "width", "length".
     Returns: a numpy array [8, 3] representing the corners of the 3d box in
         camera coordinates.
     """
 
-    yaw = label['yaw']
+    # Get yaw angle
+    yaw = label.ry
+
+    # Construct rotation matrix
     R = np.array([[np.cos(yaw), 0, np.sin(yaw)],
                   [0, 1, 0],
                   [-np.sin(yaw), 0, np.cos(yaw)]])
-    h = label['height']
-    delta_h = h * (expend_factor[0] - 1)
-    w = label['width'] * expend_factor[1]
-    l = label['length'] * expend_factor[2]
+
+    # Get box parameters
+    h = label.height
+    delta_h = h * (expand_factor[0] - 1)
+    w = label.width * expand_factor[1]
+    l = label.length * expand_factor[2]
+
+    # Compute 3D corner points
     corners = np.array([[l / 2, delta_h / 2, w / 2],  # front up right
                         [l / 2, delta_h / 2, -w / 2],  # front up left
                         [-l / 2, delta_h / 2, -w / 2],  # back up left
                         [-l / 2, delta_h / 2, w / 2],  # back up right
-                        [l / 2, -h - delta_h / 2, w / 2],
-                        # front down right
-                        [l / 2, -h - delta_h / 2, -w / 2],
-                        # front down left
-                        [-l / 2, -h - delta_h / 2, -w / 2],
-                        # back down left
-                        [-l / 2, -h - delta_h / 2,
-                         w / 2]])  # back down right
+                        [l / 2, -h - delta_h / 2, w / 2],  # front down right
+                        [l / 2, -h - delta_h / 2, -w / 2],  # front down left
+                        [-l / 2, -h - delta_h / 2, -w / 2],  # back down left
+                        [-l / 2, -h - delta_h / 2, w / 2]])  # back down right
+
+    # Rotate and translate corners
     r_corners = corners.dot(np.transpose(R))
-    tx = label['x3d']
-    ty = label['y3d']
-    tz = label['z3d']
-    cam_points_xyz = r_corners + np.array([tx, ty, tz])
+    cam_points_xyz = r_corners + np.array(label.t)
     return cam_points_xyz
 
 
-# Box encoding
-def voxelnet_box_encoding(cls_labels, points_xyz, boxes_3d):
-    # offset
-    boxes_3d[:, 0] = boxes_3d[:, 0] - points_xyz[:, 0]
-    boxes_3d[:, 1] = boxes_3d[:, 1] - points_xyz[:, 1]
-    boxes_3d[:, 2] = boxes_3d[:, 2] - points_xyz[:, 2]
-    # Car
-    mask = cls_labels[:, 0] == 2
-    boxes_3d[mask, 0] = boxes_3d[mask, 0]/3.9
-    boxes_3d[mask, 1] = boxes_3d[mask, 1]/1.56
-    boxes_3d[mask, 2] = boxes_3d[mask, 2]/1.6
-    boxes_3d[mask, 3] = np.log(boxes_3d[mask, 3]/3.9)
-    boxes_3d[mask, 4] = np.log(boxes_3d[mask, 4]/1.56)
-    boxes_3d[mask, 5] = np.log(boxes_3d[mask, 5]/1.6)
-    # Pedestrian and Cyclist
-    mask = (cls_labels[:, 0] == 1) + (cls_labels[:, 0] == 3)
-    boxes_3d[mask, 0] = boxes_3d[mask, 0]/0.8
-    boxes_3d[mask, 1] = boxes_3d[mask, 1]/1.73
-    boxes_3d[mask, 2] = boxes_3d[mask, 2]/0.6
-    boxes_3d[mask, 3] = np.log(boxes_3d[mask, 3]/0.8)
-    boxes_3d[mask, 4] = np.log(boxes_3d[mask, 4]/1.73)
-    boxes_3d[mask, 5] = np.log(boxes_3d[mask, 5]/0.6)
-    # normalize all yaws
-    boxes_3d[:, 6] = boxes_3d[:, 6]/(np.pi*0.5)
+def box_encoding(cls_labels, vertex_xyz, boxes_3d):
+    """
+    Encode bounding box parameters for regression task.
+    """
+
+    # Get masks for car classes
+    hor_mask = cls_labels[:, 0] == 1
+    vert_mask = cls_labels[:, 0] == 2
+    car_mask = hor_mask + vert_mask
+
+    # Compute offset from vertex
+    boxes_3d[:, 0] = boxes_3d[:, 0] - vertex_xyz[:, 0]
+    boxes_3d[:, 1] = boxes_3d[:, 1] - vertex_xyz[:, 1]
+    boxes_3d[:, 2] = boxes_3d[:, 2] - vertex_xyz[:, 2]
+
+    # Compute offset target
+    boxes_3d[car_mask, 0] = boxes_3d[car_mask, 0] / l_m
+    boxes_3d[car_mask, 1] = boxes_3d[car_mask, 1] / h_m
+    boxes_3d[car_mask, 2] = boxes_3d[car_mask, 2] / w_m
+
+    # Compute size targets
+    boxes_3d[car_mask, 3] = np.log(boxes_3d[car_mask, 3] / l_m)
+    boxes_3d[car_mask, 4] = np.log(boxes_3d[car_mask, 4] / h_m)
+    boxes_3d[car_mask, 5] = np.log(boxes_3d[car_mask, 5] / w_m)
+
+    # Normalize yaws
+    boxes_3d[hor_mask, 6] = boxes_3d[hor_mask, 6] / theta_m
+    boxes_3d[vert_mask, 6] = (boxes_3d[vert_mask, 6] - theta_0) / theta_m
+
     return boxes_3d
 
-def voxelnet_box_decoding(cls_labels, points_xyz, encoded_boxes):
-    # Car
-    mask = cls_labels[:, 0] == 2
-    encoded_boxes[mask, 0] = encoded_boxes[mask, 0]*3.9
-    encoded_boxes[mask, 1] = encoded_boxes[mask, 1]*1.56
-    encoded_boxes[mask, 2] = encoded_boxes[mask, 2]*1.6
-    encoded_boxes[mask, 3] = np.exp(encoded_boxes[mask, 3])*3.9
-    encoded_boxes[mask, 4] = np.exp(encoded_boxes[mask, 4])*1.56
-    encoded_boxes[mask, 5] = np.exp(encoded_boxes[mask, 5])*1.6
-    # Pedestrian and Cyclist
-    mask = (cls_labels[:, 0] == 1) + (cls_labels[:, 0] == 3)
-    encoded_boxes[mask, 0] = encoded_boxes[mask, 0]*0.8
-    encoded_boxes[mask, 1] = encoded_boxes[mask, 1]*1.73
-    encoded_boxes[mask, 2] = encoded_boxes[mask, 2]*0.6
-    encoded_boxes[mask, 3] = np.exp(encoded_boxes[mask, 3])*0.8
-    encoded_boxes[mask, 4] = np.exp(encoded_boxes[mask, 4])*1.73
-    encoded_boxes[mask, 5] = np.exp(encoded_boxes[mask, 5])*0.6
-    # offset
-    encoded_boxes[:, 0] = encoded_boxes[:, 0] + points_xyz[:, 0]
-    encoded_boxes[:, 1] = encoded_boxes[:, 1] + points_xyz[:, 1]
-    encoded_boxes[:, 2] = encoded_boxes[:, 2] + points_xyz[:, 2]
-    # recover all yaws
-    encoded_boxes[:, 6] = encoded_boxes[:, 6]*(np.pi*0.5)
-    return encoded_boxes
+
+def box_decoding(cls_labels, vertex_xyz, encoded_boxes_3d):
+    """
+    Decode bounding box parameters from regression label.
+    """
+
+    # Get masks for car classes
+    hor_mask = cls_labels[:, 0] == 1
+    vert_mask = cls_labels[:, 0] == 2
+    car_mask = hor_mask + vert_mask
+
+    # Invert scaling with dataset mean
+    encoded_boxes_3d[car_mask, 0] = encoded_boxes_3d[car_mask, 0] * l_m
+    encoded_boxes_3d[car_mask, 1] = encoded_boxes_3d[car_mask, 1] * h_m
+    encoded_boxes_3d[car_mask, 2] = encoded_boxes_3d[car_mask, 2] * w_m
+
+    # Compute absolute position by adding vertex position
+    encoded_boxes_3d[:, 0] = encoded_boxes_3d[:, 0] + vertex_xyz[:, 0]
+    encoded_boxes_3d[:, 1] = encoded_boxes_3d[:, 1] + vertex_xyz[:, 1]
+    encoded_boxes_3d[:, 2] = encoded_boxes_3d[:, 2] + vertex_xyz[:, 2]
+
+    # Compute size from predictions
+    encoded_boxes_3d[car_mask, 3] = np.exp(encoded_boxes_3d[car_mask, 3]) * l_m
+    encoded_boxes_3d[car_mask, 4] = np.exp(encoded_boxes_3d[car_mask, 4]) * h_m
+    encoded_boxes_3d[car_mask, 5] = np.exp(encoded_boxes_3d[car_mask, 5]) * w_m
+
+    # Normalize yaws
+    encoded_boxes_3d[hor_mask, 6] = encoded_boxes_3d[hor_mask, 6] * theta_m
+    encoded_boxes_3d[vert_mask, 6] = (encoded_boxes_3d[vert_mask,
+                                                       6] * theta_m) + theta_0
+
+    return encoded_boxes_3d
