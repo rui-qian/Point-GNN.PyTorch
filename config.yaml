@@ -1,0 +1,30 @@
+kp_dim: 4
+state_dim: 300
+n_classes: 4
+n_iterations: 3
+num_iterations: 1400000
+batch_size: 1
+learning_rate: 0.125
+object_classes: [2, 3]
+lambdas: [0.1, 10.0, 0.0000005]
+LR_Scheduler:
+  gamma: 0.1
+  step_size: 400000
+Dataset:
+  root_dir: '/globalwork/datasets/KITTI_object/'
+  use_rgb: False
+  voxel_size: 0.8
+  r: 4.0
+  r0: 1.0
+  max_num_edges: 256
+Logging:
+  write_file: True
+  write_tb: True
+Misc:
+  num_epochs: 3
+  val_freq: 1
+  checkpoint_freq: 2
+  log_freq: 50  # iterations
+  copy_code: True
+  n_gpu: 1
+

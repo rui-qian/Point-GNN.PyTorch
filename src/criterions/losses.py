@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
-from torch.nn import SmoothL1Loss
 import torch.nn.functional as F
-from model import PointGNN
+from torch.nn import SmoothL1Loss
+from src.models.point_gnn import PointGNN
 
+
+##############
+# Focal Loss #
+##############
 
 class FocalLoss(nn.Module):
-    # From https://github.com/mbsariyildiz/focal-loss.pytorch/
-    # blob/master/focalloss.py
     def __init__(self, gamma=0):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
@@ -32,6 +34,10 @@ class FocalLoss(nn.Module):
             raise RuntimeError
 
 
+#####################
+# Localization Loss #
+#####################
+
 class LocalizationLoss(nn.Module):
     def __init__(self):
         super(LocalizationLoss, self).__init__()
@@ -46,10 +52,14 @@ class LocalizationLoss(nn.Module):
         for i in range(loc_pred.size(1)):
 
             # Compute loss components
-            loc_loss += self.loc_loss(loc_pred[i], loc_target[i])
+            loc_loss += self.loc_loss(loc_pred[:, i], loc_target[:, i])
 
         return loc_loss
 
+
+###################
+# Multi-Task Loss #
+###################
 
 class MultiTaskLoss(nn.Module):
     def __init__(self, object_classes, lambdas):
@@ -71,13 +81,23 @@ class MultiTaskLoss(nn.Module):
         cls_loss = self.cls_loss(cls_pred, cls_target)
 
         # Compute indices of object vertices
-        object_inds = torch.nonzero(cls_target.squeeze(1) == torch
-                                    .tensor(self.object_classes))\
-            .repeat(1, loc_target.size(1))
+        object_class_tensor = torch.tensor(self.object_classes)\
+            .repeat(cls_pred.size(0), 1).to(cls_pred.device)
+        object_inds = torch.nonzero(torch.sum(cls_target ==
+                                              object_class_tensor, dim=1))
 
         # Get object predictions and targets
-        object_loc_pred = torch.gather(loc_pred, 0, object_inds)
-        object_loc_target = torch.gather(loc_target, 0, object_inds)
+        object_loc_pred = torch.gather(loc_pred, 0, object_inds
+                                       .repeat(1, loc_pred.size(1)))
+        object_loc_target = torch.gather(loc_target, 0, object_inds
+                                         .repeat(1, loc_target.size(1)))
+        object_cls_target = torch.gather(cls_target, 0, object_inds)
+
+        # Get object prediction for ground truth class
+        pred_selector = object_cls_target * loc_target.size(1) + \
+                        torch.arange(0, loc_target.size(1))\
+                            .to(loc_pred.device).long()
+        object_loc_pred = torch.gather(object_loc_pred, 1, pred_selector)
 
         # Compute regression loss
         loc_loss = self.loc_loss(object_loc_pred, object_loc_target)
@@ -111,7 +131,7 @@ if __name__ == '__main__':
     model = PointGNN(n_classes=5, n_iterations=5, kp_dim=3, state_dim=3)
     named_params = model.parameters()
 
-    criterion = MultiTaskLoss(lambdas=(0.1, 10.0, 5e-7), object_classes=[1])
+    criterion = MultiTaskLoss(lambdas=(0.1, 10.0, 5e-7), object_classes=[1, 2])
 
     loss = criterion(cls_pred, reg_pred, cls_target, reg_target, named_params)
     print(f'Loss: {loss}')
